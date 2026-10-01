@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Skyline Residency – Talk to Riya</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --green:#16a34a; --red:#dc2626; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text);
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:24px 16px; }
+  h1 { margin:0 0 4px; font-size:1.4rem; }
+  .sub { color:var(--muted); margin:0 0 24px; font-size:.95rem; }
+  #call { width:140px; height:140px; border-radius:50%; border:0; font-size:1.2rem; font-weight:600;
+          color:#fff; background:var(--green); cursor:pointer; box-shadow:0 8px 30px rgba(0,0,0,.4); }
+  #call.active { background:var(--red); }
+  #call:disabled { opacity:.6; }
+  #status { margin:16px 0; color:var(--muted); min-height:1.2em; }
+  #transcript { width:100%; max-width:560px; flex:1; background:var(--card); border-radius:12px; padding:12px;
+                overflow-y:auto; max-height:55vh; display:flex; flex-direction:column; gap:8px; }
+  .msg { padding:8px 12px; border-radius:10px; max-width:85%; line-height:1.35; white-space:pre-wrap; }
+  .user { align-self:flex-end; background:#334155; }
+  .agent { align-self:flex-start; background:#0e7490; }
+  .partial { opacity:.7; }
+  .empty { color:var(--muted); text-align:center; margin:auto; }
+</style>
+</head>
+<body>
+  <h1>Skyline Residency</h1>
+  <p class="sub">Talk to Riya, our AI sales assistant</p>
+  <button id="call">Call</button>
+  <div id="status">Tap Call and allow microphone access</div>
+  <div id="transcript"><div class="empty">Transcript will appear here</div></div>
+
+<script>
+const OUTPUT_RATE = 24000;
+const btn = document.getElementById("call");
+const statusEl = document.getElementById("status");
+const box = document.getElementById("transcript");
+
+let ws, ctx, mic, worklet;
+let playHead = 0;            // when the next audio chunk should start (ctx time)
+let sources = new Set();     // scheduled playback nodes, so barge-in can stop them
+let current = { user: null, agent: null }; // in-progress transcript bubbles
+let errored = false;
+
+const setStatus = (s) => statusEl.textContent = s;
+
+btn.onclick = () => (ws ? hangUp() : startCall());
+
+async function startCall() {
+  btn.disabled = true;
+  setStatus("Starting…");
+  try {
+    ctx = new AudioContext();
+    await ctx.resume();
+    mic = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    await ctx.audioWorklet.addModule("/static/audio-worklet.js");
+    worklet = new AudioWorkletNode(ctx, "mic-capture");
+    ctx.createMediaStreamSource(mic).connect(worklet);
+    worklet.connect(ctx.destination); // outputs silence; some browsers only run connected nodes
+  } catch (e) {
+    setStatus("Microphone error: " + e.message);
+    cleanup();
+    return;
+  }
+
+  box.innerHTML = "";
+  errored = false;
+  current = { user: null, agent: null };
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/web`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    setStatus("Connected – say hello!");
+    btn.textContent = "Hang up";
+    btn.classList.add("active");
+    btn.disabled = false;
+    worklet.port.onmessage = (e) => { if (ws && ws.readyState === 1) ws.send(e.data); };
+  };
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) return playChunk(e.data);
+    const msg = JSON.parse(e.data);
+    if (msg.type === "interrupted") flushPlayback();
+    else if (msg.type === "transcript") showTranscript(msg);
+    else if (msg.type === "error") { setStatus("Error: " + msg.message); errored = true; }
+  };
+  const sock = ws;
+  ws.onclose = () => { if (ws === sock) { if (!errored) setStatus("Call ended"); cleanup(); } };
+  ws.onerror = () => setStatus("Connection error");
+}
+
+function hangUp() {
+  const sock = ws;
+  cleanup();
+  if (sock) sock.close();
+  setStatus("Call ended");
+}
+
+function cleanup() {
+  flushPlayback();
+  if (mic) mic.getTracks().forEach((t) => t.stop());
+  if (ctx) ctx.close();
+  ws = ctx = mic = worklet = null;
+  btn.textContent = "Call";
+  btn.classList.remove("active");
+  btn.disabled = false;
+}
+
+// ---- playback: schedule PCM16 24 kHz chunks back-to-back with a small jitter buffer ----
+function playChunk(buf) {
+  if (!ctx) return;
+  const pcm = new Int16Array(buf);
+  const audioBuf = ctx.createBuffer(1, pcm.length, OUTPUT_RATE);
+  const ch = audioBuf.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  const src = ctx.createBufferSource();
+  src.buffer = audioBuf;
+  src.connect(ctx.destination);
+  // If we've run dry, start 60 ms ahead to absorb network jitter.
+  playHead = Math.max(playHead, ctx.currentTime + 0.06);
+  src.start(playHead);
+  playHead += audioBuf.duration;
+  sources.add(src);
+  src.onended = () => sources.delete(src);
+}
+
+// Barge-in: drop everything queued so Riya stops talking immediately.
+function flushPlayback() {
+  sources.forEach((s) => { try { s.stop(); } catch {} });
+  sources.clear();
+  playHead = 0;
+}
+
+// ---- transcript: partial events carry deltas; the final one carries the full text ----
+function showTranscript({ role, text, final }) {
+  let el = current[role];
+  if (!el) {
+    el = document.createElement("div");
+    el.className = `msg ${role} partial`;
+    el.textContent = "";
+    box.appendChild(el);
+  }
+  if (final) {
+    el.textContent = text.trim();
+    el.classList.remove("partial");
+    current[role] = null;
+  } else {
+    el.textContent += text;
+    current[role] = el;
+  }
+  box.scrollTop = box.scrollHeight;
+}
+</script>
+</body>
+</html>
